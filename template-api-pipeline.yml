@@ -1,0 +1,349 @@
+name: template-Api-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - Services/Api/*
+
+variables:
+  - template: vars/vars-helper-api.yml
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: build
+    displayName: Build
+    jobs:
+      - job: blackduck
+        displayName: BlackDuck
+        steps:
+          - template: /templates/blackduck.yml
+            parameters:
+              # project name
+              BlackDuckProject: "name"
+              BlackDuckConnectionName: Connection-Name
+              BlackDuckSourceFolder: $(Build.SourcesDirectory)/$(ToolsRoot)
+              IsPullRequest: ${{ variables.IsPR }}
+
+      - job: build
+        displayName: Build and Test
+        steps:
+          - task: SonarCloudPrepare@1
+            displayName: Prepare Sonar analysis for .NET
+            inputs:
+              SonarCloud: MaksymKhanin.Project.Status
+              organization: MaksymKhanin
+              projectKey: MaksymKhanin.project
+              projectName: MaksymKhanin.Project
+              extraProperties: |
+                sonar.exclusions=**/obj/**,**/*.dll,**/*.csv,**/*.json,**/Tests/**,**/wwwroot/**/*
+                sonar.cs.vstest.reportsPaths=$(Agent.TempDirectory)/*.trx
+                sonar.coverageReportPaths=$(Agent.TempDirectory)/mergedcoveragereport/SonarQube.xml
+                sonar.inclusions=**/Tools/Api/src/**/*
+
+          - task: DotNetCoreCLI@2
+            displayName: Install XunitXml Logger
+            inputs:
+              command: custom
+              custom: add
+              projects: $(TestProjects)
+              arguments: package XunitXml.TestLogger --no-restore
+
+          - task: UseDotNet@2
+            displayName: "Use .NET Core sdk"
+            inputs:
+              packageType: "sdk"
+              version: "6.0.x"
+
+          - task: DotNetCoreCLI@2
+            displayName: Build
+            inputs:
+              command: build
+              # path to api .sln file
+              projects: $(ToolsRoot)/Api.sln
+              arguments: --configuration "Release"
+
+          - task: DotNetCoreCLI@2
+            displayName: Api Integration Tests
+            inputs:
+              command: test
+              projects: $(TestProjects)
+              arguments: --no-build --no-restore --logger:"xunit;LogFilePath=$(Agent.TempDirectory)/TestResults.xml" --configuration Release --collect "XPlat Code coverage" --filter Category=AcceptanceTests
+              testRunTitle: Integration Tests
+              publishTestResults: false
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            inputs:
+              testResultsFormat: "xUnit"
+              testResultsFiles: "$(Agent.TempDirectory)/TestResults.xml"
+
+          - script: |
+              dotnet tool install -g dotnet-reportgenerator-globaltool
+              reportgenerator -reports:**/coverage.cobertura.xml -targetdir:$(Agent.TempDirectory)/mergedcoveragereport -reporttypes:"Cobertura;SonarQube" -assemblyfilters:"-*Tests*;-*Fakes*"
+            displayName: Filter and Merge reports
+
+          - template: /Pipelines/templates/end-sonar.yml
+
+          - task: PublishCodeCoverageResults@1
+            displayName: Publish code coverage
+            inputs:
+              codeCoverageTool: Cobertura
+              summaryFileLocation: $(Agent.TempDirectory)/mergedcoveragereport/Cobertura.xml
+              reportDirectory: $(Agent.TempDirectory)/mergedcoveragereport
+
+          - task: DotNetCoreCLI@2
+            displayName: Publish Api
+            inputs:
+              command: publish
+              projects: "$(ToolsRoot)/Api.csproj"
+              publishWebProjects: false
+              arguments: --configuration Release --output $(Build.ArtifactStagingDirectory)/api-template --no-build --no-restore
+              zipAfterPublish: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: Emit Api Template artifact
+            inputs:
+              ArtifactName: api-template
+              PathtoPublish: $(Build.ArtifactStagingDirectory)/api-template
+
+  - ${{ if eq(variables.IsPR, true) }}:
+      - stage: plan_dev
+        displayName: Plan Dev
+        dependsOn: []
+        variables:
+          - template: vars/vars-dev.yml
+        jobs:
+          - job: tf_plan
+            displayName: Terraform plan
+            pool:
+              vmImage: ubuntu-latest
+            steps:
+              # path to terraform plan yaml file
+              - template: /pipelines/terraform-plan.yml
+                parameters:
+                  EnvironmentName: ${{ variables.Environment }}
+                  ComponentName: Template API
+                  AzureConnectionName: ${{ variables.AzureConnection }}
+                  TerraformVersion: ${{ variables.TerraformVersion }}
+                  TerraformRoot: ${{ variables.TerraformRoot }}
+
+              - task: CopyFiles@1
+                displayName: Copy Files to publish
+                inputs:
+                  TargetFolder: $(build.artifactstagingdirectory)
+                  SourceFolder: ${{ variables.TerraformRoot }}
+                  Contents: |
+                    **/*.tf
+                    **/*.tpl
+                    environments/${{ variables.Environment }}/**/*
+                    tfplan
+
+              - task: PublishPipelineArtifact@1
+                displayName: Publish pipeline artifact
+                inputs:
+                  targetPath: $(build.artifactstagingdirectory)
+                  artifact: apply_actifact_${{ variables.Environment }}_attempt_$(System.StageAttempt)
+
+              - bash: |
+                  echo "##vso[task.setvariable variable=ArtifactIndex;isOutput=true;]$(System.StageAttempt)"
+                name: ArtifactMemento
+
+      - stage: deploy_dev
+        displayName: Deploy Dev
+        dependsOn: [build, plan_dev]
+        variables:
+          - template: /vars/vars-dev.yml
+          - name: ArtifactIndex
+            value: $[ stageDependencies.plan_dev.tf_plan.outputs['ArtifactMemento.ArtifactIndex'] ]
+        jobs:
+          - job: before_deploy_${{ variables.Environment }}
+            displayName: Approve before Apply
+            pool: server
+            steps:
+              - task: ManualValidation@0
+                timeoutInMinutes: 4320 # 3 days
+                inputs:
+                  notifyUsers: ""
+                  instructions: "Do you really want to deploy on the ${{ variables.Environment }} environment ?"
+                  onTimeout: reject
+
+          - job: tf_apply
+            displayName: Terraform apply
+            dependsOn:
+              - before_deploy_${{ variables.Environment }}
+            condition: eq(dependencies.before_deploy_${{ variables.Environment }}.result, 'Succeeded')
+            steps:
+              - checkout: none
+
+              - download: current
+                displayName: Download terraform artifact
+                artifact: apply_actifact_${{ variables.Environment }}_attempt_$(ArtifactIndex)
+
+              - template: /templates/terraform-apply.yml
+                parameters:
+                  EnvironmentName: ${{ variables.Environment }}
+                  AzureConnectionName: ${{ variables.AzureConnection }}
+                  TerraformRoot: $(Pipeline.Workspace)/apply_actifact_${{ variables.Environment }}_attempt_$(ArtifactIndex)
+                  TerraformVersion: ${{ variables.TerraformVersion }}
+                  PlanFilename: tfplan
+
+          - job: get_tf_outputs
+            displayName: Get terraform outputs
+            dependsOn: tf_apply
+            steps:
+              - checkout: none
+
+              - download: current
+                displayName: Download terraform artifact
+                artifact: apply_actifact_${{ variables.Environment }}_attempt_$(ArtifactIndex)
+
+              - template: /templates/terraform-output.yml
+                parameters:
+                  EnvironmentName: ${{ variables.Environment }}
+                  AzureConnectionName: ${{ variables.AzureConnection }}
+                  TerraformRoot: $(Pipeline.Workspace)/apply_actifact_${{ variables.Environment }}_attempt_$(ArtifactIndex)
+                  TerraformVersion: ${{ variables.TerraformVersion }}
+
+          - job: deploy
+            displayName: Deploy TemplateApi
+            dependsOn: get_tf_outputs
+            condition: eq(dependencies.get_tf_outputs.result, 'Succeeded')
+            variables:
+              appServiceAppName: $[ dependencies.get_tf_outputs.outputs['tf_output.app_1_name'] ]
+            steps:
+              - checkout: none
+
+              - download: current
+                displayName: Download TemplateApi artifact
+                artifact: template-api
+
+              - task: AzureWebApp@1
+                displayName: Deploy Template Api
+                inputs:
+                  azureSubscription: ${{ variables.AzureConnection }}
+                  appType: webApp
+                  appName: $(appServiceAppName)
+                  package: $(Pipeline.Workspace)/template-api/*.zip
+
+  - ${{ if eq(variables.IsPR, false) }}:
+      - stage: plan_inte
+        displayName: Plan Inte
+        dependsOn: []
+        variables:
+          - template: vars/vars-inte.yml
+        jobs:
+          - job: tf_plan
+            displayName: Terraform plan
+            pool:
+              vmImage: ubuntu-latest
+            steps:
+              - template: /terraform-plan.yml
+                parameters:
+                  EnvironmentName: ${{ variables.Environment }}
+                  ComponentName: Template API
+                  AzureConnectionName: ${{ variables.AzureConnection }}
+                  TerraformVersion: ${{ variables.TerraformVersion }}
+                  TerraformRoot: ${{ variables.TerraformRoot }}
+
+              - task: CopyFiles@1
+                displayName: Copy Files to publish
+                inputs:
+                  TargetFolder: $(build.artifactstagingdirectory)
+                  SourceFolder: ${{ variables.TerraformRoot }}
+                  Contents: |
+                    **/*.tf
+                    **/*.tpl
+                    environments/${{ variables.Environment }}/**/*
+                    tfplan
+
+              - task: PublishPipelineArtifact@1
+                displayName: Publish pipeline artifact
+                inputs:
+                  targetPath: $(build.artifactstagingdirectory)
+                  artifact: apply_actifact_${{ variables.Environment }}_attempt_$(System.StageAttempt)
+
+              - bash: |
+                  echo "##vso[task.setvariable variable=ArtifactIndex;isOutput=true;]$(System.StageAttempt)"
+                name: ArtifactMemento
+
+      - stage: deploy_inte
+        displayName: Deploy Inte
+        dependsOn: [build, plan_inte]
+        variables:
+          - template: /vars/vars-inte.yml
+          - name: ArtifactIndex
+            value: $[ stageDependencies.plan_inte.tf_plan.outputs['ArtifactMemento.ArtifactIndex'] ]
+        jobs:
+          - job: before_deploy_${{ variables.Environment }}
+            displayName: Approve before Apply
+            pool: server
+            steps:
+              - task: ManualValidation@0
+                timeoutInMinutes: 4320 # 3 days
+                inputs:
+                  notifyUsers: ""
+                  instructions: "Do you really want to deploy on the ${{ variables.Environment }} environment ?"
+                  onTimeout: reject
+
+          - job: tf_apply
+            displayName: Terraform apply
+            dependsOn:
+              - before_deploy_${{ variables.Environment }}
+            condition: eq(dependencies.before_deploy_${{ variables.Environment }}.result, 'Succeeded')
+            steps:
+              - checkout: none
+
+              - download: current
+                displayName: Download terraform artifact
+                artifact: apply_actifact_${{ variables.Environment }}_attempt_$(ArtifactIndex)
+
+              - template: /templates/terraform-apply.yml
+                parameters:
+                  EnvironmentName: ${{ variables.Environment }}
+                  AzureConnectionName: ${{ variables.AzureConnection }}
+                  TerraformRoot: $(Pipeline.Workspace)/apply_actifact_${{ variables.Environment }}_attempt_$(ArtifactIndex)
+                  TerraformVersion: ${{ variables.TerraformVersion }}
+                  PlanFilename: tfplan
+
+          - job: get_tf_outputs
+            displayName: Get terraform outputs
+            dependsOn: tf_apply
+            steps:
+              - checkout: none
+
+              - download: current
+                displayName: Download terraform artifact
+                artifact: apply_actifact_${{ variables.Environment }}_attempt_$(ArtifactIndex)
+
+              - template: /templates/terraform-output.yml
+                parameters:
+                  EnvironmentName: ${{ variables.Environment }}
+                  AzureConnectionName: ${{ variables.AzureConnection }}
+                  TerraformRoot: $(Pipeline.Workspace)/apply_actifact_${{ variables.Environment }}_attempt_$(ArtifactIndex)
+                  TerraformVersion: ${{ variables.TerraformVersion }}
+
+          - job: deploy
+            displayName: Deploy Template Api
+            dependsOn: get_tf_outputs
+            condition: eq(dependencies.get_tf_outputs.result, 'Succeeded')
+            variables:
+              appServiceAppName: $[ dependencies.get_tf_outputs.outputs['tf_output.app_1_name'] ]
+            steps:
+              - checkout: none
+
+              - download: current
+                displayName: Download Template Api artifact
+                artifact: template-api
+
+              - task: AzureWebApp@1
+                displayName: Deploy Template Api
+                inputs:
+                  azureSubscription: ${{ variables.AzureConnection }}
+                  appType: webApp
+                  appName: $(appServiceAppName)
+                  package: $(Pipeline.Workspace)/template-api/*.zip

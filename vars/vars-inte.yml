@@ -1,0 +1,5 @@
+variables:
+  - name: Environment
+    value:
+  - name: AzureConnection
+    value:
